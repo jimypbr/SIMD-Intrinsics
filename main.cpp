@@ -8,8 +8,10 @@ using std::cout;
 using std::endl;
 using std::ptrdiff_t;
 
-#define N 101
+#define N 71
 
+// pack elements of a 128bit SSE registers left.
+// nzeros: number of LHS simd lanes with value 0
 static __m128 pack_left_128(__m128 v, int nzeros)
 {
     switch (nzeros)
@@ -27,6 +29,7 @@ static __m128 pack_left_128(__m128 v, int nzeros)
     }
 }
 
+// bit pattern mask on a SIMD lane for sse masked load/store
 static const unsigned int ON = (1<<31);
 
 static const __m128i load_mask_128[] = {_mm_setr_epi32(ON,ON,ON,ON),
@@ -64,6 +67,7 @@ inline void print_simd256(__m256 v)
         cout << vec[i] << ", ";
     cout << "}" << endl;
 }
+
 // print the contents of a 128 vec intrinsic to stdout
 inline void print_simd128(__m128 v)
 {
@@ -76,6 +80,7 @@ inline void print_simd128(__m128 v)
     cout << "}" << endl;
 }
 
+// reverse the contents of an avx register (256bit)
 inline __m256 reverse_avx(__m256 in)
 {
     __m256 perm = _mm256_permute2f128_ps(in, in, 0b00000001);
@@ -83,6 +88,7 @@ inline __m256 reverse_avx(__m256 in)
     return shuf;
 }
 
+// perform reversal on an array whose size is <VLEN
 void reverse_vectorised_subvector(float *left, float *right)
 {
     ptrdiff_t dist = right - left;
@@ -99,7 +105,8 @@ void reverse_vectorised_subvector(float *left, float *right)
             __m128 packleft = pack_left_128(rev, nzeros);
             _mm_maskstore_ps(left, store_mask_128[nzeros], packleft);
         }
-            // inside 256bit vec
+
+        // inside 256bit vec
         else
         {
             unsigned int nzeros = 8-dist;
@@ -117,15 +124,19 @@ void reverse_vectorised_subvector(float *left, float *right)
             _mm_storeu_ps(left+(4-nzeros), hi);
         }
     }
-
 }
 
+// Vectorised array reversal routine.
+// range used is [left, right)
+// left: start address of the array to be reversed.
+// right: end address+1 of the array to be reversed.
 void reverse_vectorized(float* left, float* right)
 {
     ptrdiff_t dist = right - left;
     if (dist < 0)
         exit(1);
 
+    // execute scalar reverse if dist < ALIGNMENT/2
     if (dist < 16)
     {
         float* left_ = left;
@@ -140,25 +151,16 @@ void reverse_vectorized(float* left, float* right)
         }
         return;
     }
+
+    // vectorised reverse
     else
     {
-        // peel the unaligned left and right reversals
-        // 0 1 2 3 4 5 6 7 8 9
-        //float* lalign = (float*)(((uintptr_t) left+60) & ~ (uintptr_t) 60);
-        //float* ralign = (float*)(((uintptr_t)right-60) & ~ (uintptr_t) 60);
-        float *lalign = (float *) ( ((uintptr_t) left + 60) - ((uintptr_t)left + 60)%64);
-        float *ralign = (float *) ( (uintptr_t) right - (uintptr_t)right % 64 );
-
-        cout << "l = " << ((uintptr_t)left)%1024 << endl;
-        cout << "r = " << ((uintptr_t)right)%1024 << endl;
-        cout << "lalign = " << (uintptr_t)lalign%1024 << endl;
-        cout << "ralign = " << (uintptr_t)ralign%1024 << endl;
-
-        // iterate from both ends and swap(left,right)
+        // iterate from both ends and swap(left++,right--)
+        // peel the unaligned reversals
+        float *lalign = (float *) ( ((uintptr_t) left + 28) - ((uintptr_t)left + 28)%32);
         float* left_ = left;
         float* right_ = right-1;
 
-        // peel loop
         while (left_ < lalign)
         {
             float tmp = *left_;
@@ -167,44 +169,21 @@ void reverse_vectorized(float* left, float* right)
             left_ += 1;
             right_ -=1;
         }
-        cout << "l = " << ((uintptr_t)left_)%1024 << endl;
-        cout << "r = " << ((uintptr_t)right_)%1024 << endl;
-        for (auto it = left; it != right; ++it)
-        {
-            cout << *it << ", ";
-        }
-        cout << endl;
 
-        right_ += 1;
+        // main body with aligned left_ accesses
         while ( (ptrdiff_t) (right_-left_) > 8)
         {
-            __m256 bl = _mm256_load_ps(left_);
-            //print_simd256(bl);
-            __m256 br = _mm256_loadu_ps(right_-8);
-            //print_simd256(br);
+            __m256 bl = _mm256_loadu_ps(left_);
+            __m256 br = _mm256_loadu_ps(right_-7);
             __m256 revl = reverse_avx(bl);
-            //print_simd256(revl);
             __m256 revr = reverse_avx(br);
-            //print_simd256(revr);
-            _mm256_storeu_ps(right_-8, revl);
-            _mm256_store_ps(left_, revr);
+            _mm256_storeu_ps(right_-7, revl);
+            _mm256_storeu_ps(left_, revr);
             left_ += 8;
             right_ -= 8;
-            cout << "left_ = " << (uintptr_t) left_ << endl;
-            cout << "right_ = " << (uintptr_t)right_ << endl;
         }
-        //reverse_vectorised_subvector(left_, right_);
-        cout << "*left_=" << *left_ << endl;
-        cout << "*right_=" << *right_ << endl;
-
-        for (auto it = left; it != right; ++it)
-        {
-            cout << *it << ", ";
-        }
-        cout << endl;
 
         // remainder loop
-        right_ -= 1;
         while (left_ < right_)
         {
             float tmp = *left_;
@@ -216,20 +195,13 @@ void reverse_vectorized(float* left, float* right)
     }
 }
 
-// Rotated the array a length size by offset places to the right
+// Rotated the array a length size by offset places to the right.
+// offset value is re-adjusted by offload%size
 void rotate_vectorized(float *a, int size, int offset)
 {
     int offset_ = offset % size;
     reverse_vectorized(&a[0], &a[offset_]);
-    cout << "{";
-    for (int i=0; i<N; ++i)
-        cout << a[i] << ", ";
-    cout << "}" << endl;
     reverse_vectorized(&a[offset_], &a[size]);
-    cout << "{";
-    for (int i=0; i<N; ++i)
-        cout << a[i] << ", ";
-    cout << "}" << endl;
     reverse_vectorized(&a[0], &a[size]);
 }
 
@@ -242,28 +214,26 @@ typedef std::chrono::high_resolution_clock hrclock;
 
 int main()
 {
-    float a[N] __attribute__((aligned(64)));
+    float a[N] __attribute__((aligned(32)));
 
     for (int i=0; i<N; ++i)
         a[i] = (float) i;
 
+    cout << "Before:" << endl;
     cout << "{";
     for (int i=0; i<N; ++i)
         cout << a[i] << ", ";
     cout << "}" << endl;
 
-    rotate_vectorized(&a[0], N, 8);
-    //reverse_vectorized(&a[0], &a[1]);
-    //reverse_vectorized(&a[1], &a[N]);
+    rotate_vectorized(&a[0], N, 7);
+    //reverse_vectorized(&a[20], &a[N]);
 
+    cout << "After:" << endl;
     cout << "{";
     for (int i=0; i<N; ++i)
         cout << a[i] << ", ";
     cout << "}" << endl;
 
-    //ptrdiff_t diff = (ptrdiff_t) (&a[6] - &a[0]);
-    //cout << "&a[8]-&a[0] = " << diff << endl;
-    // vector swap
 /*    auto t1 = hrclock::now();
     reverse_vectorized(&(a[0]));
     auto t2 = hrclock::now();
